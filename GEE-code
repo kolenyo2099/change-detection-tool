@@ -1,0 +1,583 @@
+// Define the Sentinel-1 collection function with orbit filtering
+function filter_s1(paths, startDate, endDate, aoi) {
+  var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.inList('orbitProperties_pass', paths))
+    .filterDate(startDate, endDate)
+    .filterBounds(aoi)
+    .select('VV');
+
+  var orbit = s1.aggregate_array('relativeOrbitNumber_start').reduce(ee.Reducer.mode());
+  s1 = s1.filter(ee.Filter.eq('relativeOrbitNumber_start', orbit));
+  
+  return s1;
+}
+
+// Function to get the mean, standard deviation, and count of images for a period
+function getStats(collection, aoi) {
+  var images = collection.filterBounds(aoi);
+  var meanImage = images.mean().clip(aoi);
+  var stdDevImage = images.reduce(ee.Reducer.stdDev()).clip(aoi);
+  var count = ee.Number(images.size());
+  return {mean: meanImage, stdDev: stdDevImage, count: count};
+}
+
+// Function to summarize OSM data in the changed areas
+function summarizeOSMChanges(changeDetectionResult, aoi) {
+  var pointsData = ee.FeatureCollection('projects/ee-guillentorres/assets/points_ukraine_b')
+    .filterBounds(aoi);
+
+  // Convert change detection result to vectors (polygons)
+  var changedAreas = changeDetectionResult.gt(0).selfMask().toInt().reduceToVectors({
+    geometry: aoi,
+    scale: 30,
+    geometryType: 'polygon',
+    eightConnected: false,
+    labelProperty: 'change',
+    reducer: ee.Reducer.countEvery()
+  });
+
+  print('Changed Areas:', changedAreas);
+
+  // Intersect points with changed areas
+  var intersected = pointsData.filterBounds(changedAreas.geometry());
+  print('Intersected Points:', intersected);
+
+  // Get the list of types
+  var countByType = intersected.aggregate_histogram('fclass');
+  
+  return {intersected: intersected, countByType: countByType};
+}
+
+// Function to calculate BADI
+function calculateBADI(preFireStart, preFireEnd, postFireStart, postFireEnd, aoi) {
+  var s2 = ee.ImageCollection('COPERNICUS/S2')
+    .filterBounds(aoi)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(function(image) {
+      return image.clip(aoi).select(['B8', 'B8A', 'B11', 'B12']);
+    });
+
+  var preFire = s2.filterDate(preFireStart, preFireEnd).mean();
+  var postFire = s2.filterDate(postFireStart, postFireEnd).mean();
+
+  var preBADI = preFire.expression(
+    '((B11 + B12) - (B8 + B8A)) / ((B11 + B12) + (B8 + B8A))', {
+      'B11': preFire.select('B11'),
+      'B12': preFire.select('B12'),
+      'B8': preFire.select('B8'),
+      'B8A': preFire.select('B8A')
+    }).rename('BADI');
+
+  var postBADI = postFire.expression(
+    '((B11 + B12) - (B8 + B8A)) / ((B11 + B12) + (B8 + B8A))', {
+      'B11': postFire.select('B11'),
+      'B12': postFire.select('B12'),
+      'B8': postFire.select('B8'),
+      'B8A': postFire.select('B8A')
+    }).rename('BADI');
+
+  var dBADI = postBADI.subtract(preBADI).rename('dBADI');
+  
+  var thresholded = dBADI.gt(0.1).selfMask();
+  
+  return thresholded;
+}
+
+// Short explanation of the tool
+var explanation = ui.Label(
+  '### About This Tool\n\n' +
+  'This tool provides three distinct analysis options using Sentinel-1 SAR and Sentinel-2 data: \n' +
+  '1.**Construction Detection:** Focuses on identifying new construction by detecting significant increases in radar backscatter values. This helps in spotting new buildings and infrastructure developments. \n' +
+  '2.**Damage Detection (PWTT):** Utilizes the Pixel-Wise T-Test (PWTT) method to identify areas with persistent damage, such as buildings affected by conflicts. This method leverages temporal consistency in damage and is highly effective for detecting destruction.  \n' +
+  '3. **Burnt Area Detection:** Uses Sentinel-2 data to detect areas affected by fire, analyzing changes in vegetation indices before and after the event.\n\n' +
+  '**Key Points to Remember:**\n' +
+  '* **Threshold Sensitivity:** For construction detection, lower threshold values make the tool more sensitive to minor changes, while higher values focus on significant transformations. For damage detection and burnt area detection, the threshold slider is not used. \n' +
+  '* **Understanding Results:** The colored areas on the map indicate regions with changes above the selected threshold or identified by the specific detection method, suggesting significant activities such as rebuilding, destruction, or burning.\n' +
+  '* **AOI Selection:** Ensure you draw a valid Area of Interest (AOI) on the map to get accurate results. Use the rectangle tool (next to the white hand in the upper left corner). For optimal performance, select smaller areas to avoid processing limits.',
+  {whiteSpace: 'pre-wrap'}
+);
+
+// Define the user interface
+var panel = ui.Panel({style: {width: '300px'}});
+ui.root.insert(0, panel);
+
+// Title
+var title = ui.Label({
+  value: 'Change Detection tool (construction, destruction, fires)',
+  style: {fontSize: '20px', fontWeight: 'bold', textAlign: 'center', margin: '10px 0'}
+});
+panel.add(title);
+
+// Add button to hide/show explanation
+var explanationButton = ui.Button({
+  label: 'Hide Explanation',
+  onClick: function() {
+    if (panel.widgets().contains(explanation)) {
+      panel.remove(explanation);
+      explanationButton.setLabel('Show Explanation');
+    } else {
+      panel.insert(panel.widgets().indexOf(explanationButton) + 1, explanation);
+      explanationButton.setLabel('Hide Explanation');
+    }
+  }
+});
+panel.add(explanationButton);
+
+// Add explanation
+panel.add(explanation);
+
+// Date inputs
+var startDateLabel = ui.Label('Select Start Date (Before)');
+var startDateInput = ui.Textbox({placeholder: 'YYYY-MM-DD', value: '2023-05-06'});
+var endDateLabel = ui.Label('Select End Date (After)');
+var endDateInput = ui.Textbox({placeholder: 'YYYY-MM-DD', value: '2024-05-28'});
+
+var datePanel = ui.Panel({
+  widgets: [startDateLabel, startDateInput, endDateLabel, endDateInput],
+  layout: ui.Panel.Layout.flow('vertical')
+});
+panel.add(datePanel);
+
+// Burnt area specific date inputs
+var preFireStartLabel = ui.Label('Pre-Fire Start Date');
+var preFireStartInput = ui.Textbox({placeholder: 'YYYY-MM-DD', value: '2023-02-06'});
+
+var preFireEndLabel = ui.Label('Pre-Fire End Date');
+var preFireEndInput = ui.Textbox({placeholder: 'YYYY-MM-DD', value: '2023-05-06'});
+
+var postFireStartLabel = ui.Label('Post-Fire Start Date');
+var postFireStartInput = ui.Textbox({placeholder: 'YYYY-MM-DD', value: '2024-02-28'});
+
+var postFireEndLabel = ui.Label('Post-Fire End Date');
+var postFireEndInput = ui.Textbox({placeholder: 'YYYY-MM-DD', value: '2024-05-28'});
+
+// Explanation for pre-fire and post-fire dates
+var fireDateExplanation = ui.Label(
+  '### Selecting Dates for Burnt Area Detection\n\n' +
+  'For human-caused fires, select pre-fire dates close to the event to capture the immediate impact. For natural fires, choose pre-fire dates from the same season in the previous year to account for seasonal variations.',
+  {whiteSpace: 'pre-wrap'}
+);
+
+var fireDatePanel = ui.Panel({
+  widgets: [
+    preFireStartLabel, preFireStartInput,
+    preFireEndLabel, preFireEndInput,
+    postFireStartLabel, postFireStartInput,
+    postFireEndLabel, postFireEndInput,
+    fireDateExplanation
+  ],
+  layout: ui.Panel.Layout.flow('vertical')
+});
+
+// Initially hide the fire date panel
+panel.add(fireDatePanel);
+panel.remove(fireDatePanel);
+
+// Threshold slider and info button
+var thresholdLabel = ui.Label({
+  value: 'Select Threshold',
+  style: {color: 'blue'}
+});
+var thresholdSlider = ui.Slider({
+  min: 1,
+  max: 10,
+  value: 3,
+  step: 0.1
+});
+
+var thresholdPanel = ui.Panel({
+  widgets: [thresholdLabel, thresholdSlider],
+  layout: ui.Panel.Layout.flow('vertical')
+});
+panel.add(thresholdPanel);
+
+// Explanation about the threshold
+var thresholdExplanation = ui.Label(
+  '### Explanation of the Threshold Slider\n\n' +
+  '**What is a Threshold?**\n' +
+  'The threshold is a value that determines what level of change is considered significant. When you compare images from two different dates, the threshold helps filter out minor variations and highlight only substantial changes.\n\n' +
+  '**How to Use the Threshold Slider:**\n' +
+  '* Lower Threshold Values (e.g., 1-3): These values make the analysis more sensitive, detecting even small changes. Use lower values to see finer details and minor changes.\n' +
+  '* Higher Threshold Values (e.g., 7-10): These values make the analysis less sensitive, highlighting only major changes. Use higher values to focus on significant transformations, such as large-scale construction or demolition.\n\n' +
+  '**Understanding the Results:**\n' +
+  'Adjust the slider to see how different threshold values affect the detected changes. The colored areas on the map represent regions where changes exceed the chosen threshold, indicating significant differences between the two dates.\n\n' +
+  'By experimenting with the threshold slider, you can tailor the analysis to your specific needs, whether you\'re interested in detailed changes or major transformations.',
+  {whiteSpace: 'pre-wrap'}
+);
+
+// Add button to hide/show threshold explanation
+var thresholdExplanationButton = ui.Button({
+  label: 'Hide Threshold Explanation',
+  onClick: function() {
+    if (panel.widgets().contains(thresholdExplanation)) {
+      panel.remove(thresholdExplanation);
+      thresholdExplanationButton.setLabel('Show Threshold Explanation');
+    } else {
+      panel.insert(panel.widgets().indexOf(thresholdExplanationButton) + 1, thresholdExplanation);
+      thresholdExplanationButton.setLabel('Hide Threshold Explanation');
+    }
+  }
+});
+panel.add(thresholdExplanationButton);
+
+// Add threshold explanation
+panel.add(thresholdExplanation);
+
+// Detection type radio buttons
+var detectionTypeLabel = ui.Label('Select Detection Type');
+var detectionTypeSelect = ui.Select({
+  items: ['Construction Detection','Damage Detection (PWTT)', 'Burnt Area Detection'],
+  value: 'Construction Detection',
+  onChange: function(selected) {
+    if (selected === 'Burnt Area Detection') {
+      if (!panel.widgets().contains(fireDatePanel)) {
+        panel.add(fireDatePanel);
+      }
+      if (panel.widgets().contains(thresholdPanel)) {
+        panel.remove(thresholdPanel);
+        panel.remove(thresholdExplanationButton);
+        panel.remove(thresholdExplanation);
+      }
+    } else {
+      if (panel.widgets().contains(fireDatePanel)) {
+        panel.remove(fireDatePanel);
+      }
+      if (!panel.widgets().contains(thresholdPanel)) {
+        panel.add(thresholdPanel);
+        panel.add(thresholdExplanationButton);
+        panel.add(thresholdExplanation);
+      }
+    }
+  }
+});
+
+var detectionTypePanel = ui.Panel({
+  widgets: [detectionTypeLabel, detectionTypeSelect],
+  layout: ui.Panel.Layout.flow('vertical')
+});
+panel.add(detectionTypePanel);
+
+// Label to display alert messages
+var alertLabel = ui.Label('', {color: 'red'});
+
+// Button to run the analysis
+var analyzeButton = ui.Button({
+  label: 'Analyze',
+  onClick: function() {
+    alertLabel.setValue('Running analysis...');
+    var startDate = startDateInput.getValue();
+    var endDate = endDateInput.getValue();
+    var threshold = thresholdSlider.getValue();
+    var detectionType = detectionTypeSelect.getValue();
+    var preFireStart = preFireStartInput.getValue();
+    var preFireEnd = preFireEndInput.getValue();
+    var postFireStart = postFireStartInput.getValue();
+    var postFireEnd = postFireEndInput.getValue();
+    runAnalysis(startDate, endDate, threshold, detectionType, preFireStart, preFireEnd, postFireStart, postFireEnd);
+  }
+});
+
+// Panel to display the results
+var resultsPanel = ui.Panel();
+
+// Button to reset the map to its initial state
+var resetButton = ui.Button({
+  label: 'Reset Map',
+  onClick: function() {
+    resetMap();
+  }
+});
+
+// Button to copy the current map view link to Google Maps
+var copyLinkButton = ui.Button({
+  label: 'Show Google Maps Link',
+  onClick: function() {
+    showGoogleMapsLink();
+  }
+});
+
+// Button to show Sentinel Hub EO Browser link
+var showSentinelHubButton = ui.Button({
+  label: 'Show Sentinel Hub EO Browser Link',
+  onClick: function() {
+    showSentinelHubLink();
+  }
+});
+
+// Panel to display the Google Maps and Sentinel Hub links
+var linkPanel = ui.Panel();
+
+// Add inputs and explanation to the panel
+panel.add(analyzeButton);
+panel.add(resultsPanel);
+panel.add(copyLinkButton);
+panel.add(showSentinelHubButton);
+panel.add(linkPanel);
+panel.add(resetButton);
+panel.add(alertLabel);
+
+// Function to set Google Maps satellite layer as the base map
+function setGoogleMapsBaseLayer() {
+  Map.setOptions('SATELLITE'); // Use ROADMAP for city and town names
+}
+
+// Function to reset the map to its initial state
+function resetMap() {
+  Map.clear();
+  setGoogleMapsBaseLayer();
+  resetDrawingTools();
+  alertLabel.setValue('');
+  resultsPanel.clear();
+  linkPanel.clear();
+  Map.setCenter(37.5347, 47.0951, 12); // Center map on Mariupol initially
+}
+
+// Function to reset the drawing tools
+function resetDrawingTools() {
+  var drawingTools = Map.drawingTools();
+  drawingTools.clear();
+  drawingTools.setDrawModes(['rectangle']);
+  drawingTools.draw();
+}
+
+// Function to generate a random color
+function getRandomColor() {
+  var letters = '0123456789ABCDEF';
+  var color = '#';
+  for (var i = 0; i < 6; i++) {
+    color += letters[Math.floor(Math.random() * 16)];
+  }
+  return color;
+}
+
+// Function to run the analysis
+function runAnalysis(startDate, endDate, threshold, detectionType, preFireStart, preFireEnd, postFireStart, postFireEnd) {
+  // Ensure the user has drawn an AOI
+  var drawingTools = Map.drawingTools();
+  var aoiLayers = drawingTools.layers();
+  if (aoiLayers.length() == 0 || !aoiLayers.get(0).getEeObject()) {
+    alertLabel.setValue('Please draw an area of interest (AOI) on the map.');
+    return;
+  }
+
+  var aoi = ee.Feature(aoiLayers.get(0).getEeObject()).geometry();
+  if (!aoi || aoi.type().getInfo() !== 'Polygon') {
+    alertLabel.setValue('Please draw a valid area of interest (AOI) on the map.');
+    return;
+  }
+
+  // Clear the alert label
+  alertLabel.setValue('');
+
+  // Define the color map globally within the function
+  var colorMap = {};
+
+  // Capture the current map center and zoom level
+  var currentCenter = Map.getCenter();
+  var currentZoom = Map.getZoom();
+  var centerLon = currentCenter.coordinates().get(0).getInfo();
+  var centerLat = currentCenter.coordinates().get(1).getInfo();
+
+  // Clear previous layers
+  Map.clear();
+
+  if (detectionType === 'Burnt Area Detection') {
+    var burntAreas = calculateBADI(preFireStart, preFireEnd, postFireStart, postFireEnd, aoi);
+    Map.addLayer(burntAreas, {palette: ['red']}, 'Burnt Areas');
+
+    // Summarize OSM changes
+    var osmSummary = summarizeOSMChanges(burntAreas, aoi);
+    osmSummary.countByType.evaluate(function(result) {
+      resultsPanel.clear();
+      if (result) {
+        print('OSM Summary Result:', result); // Debugging print statement
+        resultsPanel.add(ui.Label('Affected Places (from OSM):', {fontWeight: 'bold'}));
+        Object.keys(result).forEach(function(key) {
+          var count = result[key];
+          var color = colorMap[key] || getRandomColor();
+          colorMap[key] = color;
+          resultsPanel.add(ui.Label(key + ': ' + count, {color: color}));
+        });
+      } else {
+        resultsPanel.add(ui.Label('No OSM data found in the changed areas.'));
+      }
+    });
+
+    // Group OSM points by type and display them
+    osmSummary.intersected.evaluate(function(intersectedPoints) {
+      if (intersectedPoints && intersectedPoints.features.length > 0) {
+        var groupedFeatures = {};
+        intersectedPoints.features.forEach(function(feature) {
+          var featureType = feature.properties.fclass;
+          if (!groupedFeatures[featureType]) {
+            groupedFeatures[featureType] = [];
+          }
+          groupedFeatures[featureType].push(ee.Feature(feature));
+        });
+
+        Object.keys(groupedFeatures).forEach(function(featureType) {
+          var color = colorMap[featureType] || getRandomColor();
+          colorMap[featureType] = color;
+          var layer = ee.FeatureCollection(groupedFeatures[featureType]);
+          Map.addLayer(layer, {color: color}, featureType);
+        });
+      }
+    });
+
+  } else {
+    // Load land cover data
+    var landCover = ee.ImageCollection('ESA/WorldCover/v100').first().select('Map');
+
+    // Mask agricultural areas (class 40) and water bodies (class 80)
+    var nonAgriWaterMask = landCover.neq(40).and(landCover.neq(80));
+
+    // Filter Sentinel-1 collection by orbit and relative orbit number for pre-event and post-event periods
+    var s1PreEvent = filter_s1(['ASCENDING', 'DESCENDING'], '2023-01-01', startDate, aoi);
+    var s1PostEvent = filter_s1(['ASCENDING', 'DESCENDING'], startDate, endDate, aoi);
+
+    // Get stats for pre-event images
+    var preEventStats = getStats(s1PreEvent, aoi);
+
+    // Get stats for post-event images
+    var postEventStats = getStats(s1PostEvent, aoi);
+
+    // Calculate the pooled standard deviation
+    var pooledSD = preEventStats.stdDev
+      .multiply(preEventStats.stdDev)
+      .multiply(preEventStats.count.subtract(1))
+      .add(postEventStats.stdDev.multiply(postEventStats.stdDev).multiply(postEventStats.count.subtract(1)))
+      .divide(preEventStats.count.add(postEventStats.count).subtract(2))
+      .sqrt();
+
+    // Calculate the denominator of the t-test
+    var denom = pooledSD.multiply(
+      ee.Number(1).divide(preEventStats.count).add(ee.Number(1).divide(postEventStats.count)).sqrt()
+    );
+
+    // Calculate the t-score
+    var tScore = postEventStats.mean.subtract(preEventStats.mean).divide(denom);
+
+    if (detectionType === 'Damage Detection (PWTT)') {
+      // Use absolute t-scores for damage detection
+      var significantChange = tScore.abs().selfMask().updateMask(nonAgriWaterMask);
+
+      // Define visualization parameters
+      var changeVizParams = {min: 1, max: 5, palette: ['00FF00', 'FFFF00', 'FFA500', 'FF0000'], opacity: 0.6}; // Gradient for damage with transparency for low values
+    } else if (detectionType === 'Construction Detection') {
+      // Focus on positive t-scores for construction detection
+      var significantChange = tScore.gt(threshold).selfMask().updateMask(nonAgriWaterMask);
+
+      // Define visualization parameters
+      var changeVizParams = {min: 0, max: 1, palette: ['00FF00'], opacity: 0.6}; // Green for construction
+    }
+
+    // Set Google Maps roadmap layer as the base map
+    setGoogleMapsBaseLayer();
+
+    // Restore the map center and zoom level
+    Map.setCenter(centerLon, centerLat, currentZoom);
+
+    // Display the results
+    Map.addLayer(significantChange, changeVizParams, detectionType);
+
+    // Debugging: Print change detection result to console
+    print('Change Detection Result:', significantChange);
+
+    // Summarize OSM changes
+    var osmSummary = summarizeOSMChanges(significantChange, aoi);
+    osmSummary.countByType.evaluate(function(result) {
+      resultsPanel.clear();
+      if (result) {
+        print('OSM Summary Result:', result); // Debugging print statement
+        resultsPanel.add(ui.Label('Affected Places (from OSM):', {fontWeight: 'bold'}));
+        Object.keys(result).forEach(function(key) {
+          var count = result[key];
+          var color = colorMap[key] || getRandomColor();
+          colorMap[key] = color;
+          resultsPanel.add(ui.Label(key + ': ' + count, {color: color}));
+        });
+      } else {
+        resultsPanel.add(ui.Label('No OSM data found in the changed areas.'));
+      }
+    });
+
+    // Group OSM points by type and display them
+    osmSummary.intersected.evaluate(function(intersectedPoints) {
+      if (intersectedPoints && intersectedPoints.features.length > 0) {
+        var groupedFeatures = {};
+        intersectedPoints.features.forEach(function(feature) {
+          var featureType = feature.properties.fclass;
+          if (!groupedFeatures[featureType]) {
+            groupedFeatures[featureType] = [];
+          }
+          groupedFeatures[featureType].push(ee.Feature(feature));
+        });
+
+        Object.keys(groupedFeatures).forEach(function(featureType) {
+          var color = colorMap[featureType] || getRandomColor();
+          colorMap[featureType] = color;
+          var layer = ee.FeatureCollection(groupedFeatures[featureType]);
+          Map.addLayer(layer, {color: color}, featureType);
+        });
+      }
+    });
+  }
+
+  // Remove the drawn AOI
+  drawingTools.layers().forEach(function(layer) {
+    drawingTools.layers().remove(layer);
+  });
+
+  // Reset the drawing tools for another analysis
+  resetDrawingTools();
+}
+
+// Function to show the current map view link to Google Maps
+function showGoogleMapsLink() {
+  var center = Map.getCenter();
+  var zoom = Map.getZoom();
+  var lat = center.coordinates().get(1).getInfo();
+  var lon = center.coordinates().get(0).getInfo();
+  var googleMapsUrl = 'https://www.google.com/maps/@' + lat + ',' + lon + ',' + zoom + 'z';
+
+  // Clear previous link if any
+  linkPanel.clear();
+
+  // Display the URL in a textbox for the user to copy
+  var urlLabel = ui.Label('Google Maps Link:');
+  var urlTextbox = ui.Textbox({value: googleMapsUrl, style: {width: '100%'}});
+  
+  linkPanel.add(urlLabel);
+  linkPanel.add(urlTextbox);
+  
+  urlTextbox.style().set('fontSize', '10px'); // Adjust text size to fit the panel
+  urlTextbox.setValue(googleMapsUrl); // Set the value of the textbox
+}
+
+// Function to show the current map view link to Sentinel Hub EO Browser
+function showSentinelHubLink() {
+  var center = Map.getCenter();
+  var zoom = Map.getZoom();
+  var lat = center.coordinates().get(1).getInfo();
+  var lon = center.coordinates().get(0).getInfo();
+  var sentinelHubUrl = 'https://apps.sentinel-hub.com/eo-browser/?lat=' + lat + '&lng=' + lon + '&zoom=' + zoom;
+
+  // Clear previous link if any
+  linkPanel.clear();
+
+  // Display the URL in a textbox for the user to copy
+  var urlLabel = ui.Label('Sentinel Hub EO Browser Link:');
+  var urlTextbox = ui.Textbox({value: sentinelHubUrl, style: {width: '100%'}});
+  
+  linkPanel.add(urlLabel);
+  linkPanel.add(urlTextbox);
+  
+  urlTextbox.style().set('fontSize', '10px'); // Adjust text size to fit the panel
+  urlTextbox.setValue(sentinelHubUrl); // Set the value of the textbox
+}
+
+// Initial setup
+setGoogleMapsBaseLayer();
+resetDrawingTools(); // Reset drawing tools to allow drawing a rectangle
+Map.setCenter(37.5347, 47.0951, 12); // Center map on Mariupol initially

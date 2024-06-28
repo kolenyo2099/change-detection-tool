@@ -1,227 +1,840 @@
-// Load the country list asset
-var countryList = ee.FeatureCollection('projects/ee-guillentorres/assets/country_list');
+// Define the Sentinel-1 collection
+var sentinel1Collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .select('VV');
 
-// Initialize the UI panels
-var panel = ui.Panel({style: {width: '300px'}});
-var explanation = ui.Label('This app allows you to load the Global Google-Microsoft Open Buildings Dataset, draw an Area of Interest (AOI), and use it to get visual leads to spot recent construction using Sentinel-1 data. ' +
-  'To use the app, follow these steps:\n' +
-  '1. Draw an AOI on the map. Try to keep it relatively small.\n' +
-  '2. Select a country from the dropdown.\n' +
-  '3. Choose the start and end dates for the analysis. A careful choice of dates will help you get better leads.\n' +
-  '4. Click "Analyze" to see the results.\n' +
-  'The results will show areas with likely changes, color-coded from green to red, passing through yellow. Click the "show Google Maps link" to get a URL you can copy and paste in your browser.',
-  {whiteSpace: 'pre-wrap'});
-var explanationVisible = true;
+// Function to get the mean and standard deviation images for a specified period including a given date
+function getMeanAndStdDevImages(collection, date, period, aoi) {
+  var endDate = ee.Date(date);
+  var startDate = endDate.advance(-period, 'month');
+  var images = collection.filterBounds(aoi)
+                         .filterDate(startDate, endDate.advance(1, 'day')) // Include the selected date
+                         .select('VV');
+  var meanImage = images.mean().clip(aoi);
+  var stdDevImage = images.reduce(ee.Reducer.stdDev()).clip(aoi);
+  var imageDates = images.aggregate_array('system:time_start').map(function(d) {
+    return ee.Date(d).format('YYYY-MM-dd');
+  });
+  return {mean: meanImage, stdDev: stdDevImage, count: images.size(), dates: imageDates};
+}
 
-// Button to toggle the visibility of the explanation text
+// Function to get the closest image to a specified date
+function getClosestImage(collection, date, aoi) {
+  var targetDate = ee.Date(date);
+  var images = collection.filterBounds(aoi)
+                         .filterDate(targetDate.advance(-15, 'day'), targetDate.advance(15, 'day'))
+                         .sort('system:time_start');
+  var closestImage = ee.Image(images.first()).clip(aoi);
+  return closestImage;
+}
+
+// Function to set Google Maps satellite layer as the base map
+function setGoogleMapsBaseLayer() {
+  Map.setOptions('SATELLITE');
+}
+
+// Function to calculate t-scores and adjust for statistical significance
+function calculateTScores(meanBefore, stdDevBefore, meanAfter, detectionType, threshold) {
+  var tScores = meanAfter.subtract(meanBefore).divide(stdDevBefore);
+  
+  if (detectionType === 'construction') {
+    tScores = tScores.subtract(threshold); // Positive t-scores for construction
+  } else {
+    tScores = tScores.abs().subtract(threshold); // General change detection
+  }
+
+  return tScores;
+}
+
+// Function to add a legend to the map
+function addLegend() {
+  var legend = ui.Panel({
+    style: {position: 'bottom-left'}
+  });
+
+  var legendTitle = ui.Label({
+    value: 'Legend',
+    style: {fontWeight: 'bold', fontSize: '16px', margin: '0 0 4px 0'}
+  });
+  legend.add(legendTitle);
+
+  var makeRow = function(color, name) {
+    var colorBox = ui.Label({
+      style: {
+        backgroundColor: '#' + color,
+        padding: '8px',
+        margin: '0 0 4px 0'
+      }
+    });
+    var description = ui.Label({
+      value: name,
+      style: {margin: '0 0 4px 6px'}
+    });
+    return ui.Panel({
+      widgets: [colorBox, description],
+      layout: ui.Panel.Layout.Flow('horizontal')
+    });
+  };
+
+  var lowChange = makeRow('0000FF', 'Low change');
+  var mediumChange = makeRow('00FF00', 'Medium change');
+  var highChange = makeRow('FFFF00', 'High change');
+  var veryHighChange = makeRow('FFA500', 'Very high change');
+  var extremeChange = makeRow('FF0000', 'Extreme change');
+
+  legend.add(lowChange);
+  legend.add(mediumChange);
+  legend.add(highChange);
+  legend.add(veryHighChange);
+  legend.add(extremeChange);
+
+  Map.add(legend);
+}
+
+// Function to evaluate the threshold
+function evaluateThreshold(tScores, threshold, logBox) {
+  var stats = tScores.reduceRegion({
+    reducer: ee.Reducer.percentile([90, 95, 99]),
+    geometry: userAOI,
+    scale: 10,
+    maxPixels: 1e9
+  });
+  
+  stats.evaluate(function(result) {
+    var p90 = result.VV_p90;
+    var p95 = result.VV_p95;
+    var p99 = result.VV_p99;
+
+    logBox.add(ui.Label('90th Percentile of t-scores: ' + p90));
+    logBox.add(ui.Label('95th Percentile of t-scores: ' + p95));
+    logBox.add(ui.Label('99th Percentile of t-scores: ' + p99));
+    
+    var message;
+    if (threshold > p99) {
+      message = 'The current threshold of ' + threshold + ' is too high. Consider lowering it to around ' + p95 + ' or ' + p99 + ' for more sensitivity.';
+    } else if (threshold < p90) {
+      message = 'The current threshold of ' + threshold + ' is too low. Consider raising it to around ' + p90 + ' or ' + p95 + ' for better specificity.';
+    } else {
+      message = 'The current threshold of ' + threshold + ' is within a reasonable range.';
+    }
+    logBox.add(ui.Label(message));
+  });
+}
+
+// Function to run the multi-image analysis
+function runAnalysis(beforeDate, afterDate) {
+  var aoi = userAOI;
+
+  // Get the mean and standard deviation images for the period before the start date
+  var meanAndStdDevBefore = getMeanAndStdDevImages(sentinel1Collection, beforeDate, 3, aoi);
+  var meanImageBefore = meanAndStdDevBefore.mean;
+  var stdDevImageBefore = meanAndStdDevBefore.stdDev;
+  var countBefore = meanAndStdDevBefore.count;
+  var datesBefore = meanAndStdDevBefore.dates;
+
+  // Get the mean and standard deviation images for the period before the end date
+  var meanAndStdDevAfter = getMeanAndStdDevImages(sentinel1Collection, afterDate, 3, aoi);
+  var meanImageAfter = meanAndStdDevAfter.mean;
+  var countAfter = meanAndStdDevAfter.count;
+  var datesAfter = meanAndStdDevAfter.dates;
+
+  // Calculate the t-scores
+  var tScores = calculateTScores(meanImageBefore, stdDevImageBefore, meanImageAfter, detectionType, threshold);
+
+  // Calculate the mean, max, min, and percentiles of the t-scores
+  var stats = tScores.reduceRegion({
+    reducer: ee.Reducer.mean().combine({
+      reducer2: ee.Reducer.minMax(),
+      sharedInputs: true
+    }),
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e9
+  });
+
+  var percentiles = tScores.reduceRegion({
+    reducer: ee.Reducer.percentile([90]),
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e9
+  });
+
+  stats.evaluate(function(result) {
+    meanLabel.setValue('Mean of the t-scores: ' + result.VV_mean);
+    maxLabel.setValue('Max t-score: ' + result.VV_max);
+    minLabel.setValue('Min t-score: ' + result.VV_min);
+  });
+
+  percentiles.evaluate(function(result) {
+    var t90 = result.VV_p90;
+
+    // Display the number of images and their dates
+    beforeImagesLabel.setValue('Images used for before period: ' + countBefore.getInfo());
+    afterImagesLabel.setValue('Images used for after period: ' + countAfter.getInfo());
+
+    datesBefore.evaluate(function(dates) {
+      beforeDatesLabel.setValue('Dates: ' + dates.join(', '));
+    });
+    datesAfter.evaluate(function(dates) {
+      afterDatesLabel.setValue('Dates: ' + dates.join(', '));
+    });
+
+    // Create an empty image
+    var empty = ee.Image().byte();
+
+    // Display the t-scores layer with 60% transparency
+    var tScoresLayer = tScores.updateMask(tScores.gt(0)).visualize({
+      min: 0,
+      max: t90,
+      palette: [
+        '0000FF', // Blue: low change
+        '00FF00', // Green: medium change
+        'FFFF00', // Yellow: high change
+        'FFA500', // Orange: very high change
+        'FF0000'  // Red: extreme change
+      ],
+      opacity: 0.6
+    });
+    Map.addLayer(tScoresLayer, {}, 'T-Scores');
+
+    // Add the legend
+    addLegend();
+
+    // Evaluate the threshold
+    evaluateThreshold(tScores, threshold, logBox);
+
+    // Check if buildings should be ignored
+    if (!ignoreBuildingsCheckbox.getValue()) {
+      // Fetch the building footprints and points within AOI
+      var datasetPath = countryIso === 'PSE' ? 'projects/ee-guillentorres/assets/PSE_polygons' : 'projects/sat-io/open-datasets/VIDA_COMBINED/' + countryIso;
+      var buildings = ee.FeatureCollection(datasetPath).filterBounds(aoi);
+      var points = ee.FeatureCollection('projects/ee-guillentorres/assets/points_ukraine_b').filterBounds(aoi);
+
+      // Reduce regions for buildings and points with t-scores
+      var buildingScores = tScores.reduceRegions({
+        collection: buildings,
+        reducer: ee.Reducer.mean(),
+        scale: 10
+      });
+
+      // Filter buildings based on t-scores
+      var highChangeBuildings = buildingScores.filter(ee.Filter.gt('mean', t90 * 0.9));
+      var veryHighChangeBuildings = buildingScores.filter(ee.Filter.gt('mean', t90 * 0.95));
+      var extremeChangeBuildings = buildingScores.filter(ee.Filter.gt('mean', t90));
+
+      var combinedChangeBuildings = highChangeBuildings.merge(veryHighChangeBuildings).merge(extremeChangeBuildings);
+
+      combinedChangeBuildings.size().evaluate(function(size) {
+        logBox.add(ui.Label('Combined Change Buildings Count: ' + size));
+      });
+
+      // Dissolve the geometry for containment checks
+      var combinedChangeBuildingsGeom = combinedChangeBuildings.geometry().dissolve();
+
+      combinedChangeBuildingsGeom.evaluate(function(geom) {
+        logBox.add(ui.Label('Combined Change Buildings Geometry: ' + JSON.stringify(geom)));
+
+        var highChangePoints = points.filter(ee.Filter.contains({
+          leftField: '.geo',
+          rightValue: combinedChangeBuildingsGeom,
+          maxError: 1
+        }));
+
+        highChangePoints.size().evaluate(function(size) {
+          logBox.add(ui.Label('High Change Points Count: ' + size));
+        });
+
+        highChangePoints.size().evaluate(function(count) {
+          if (count === 0) {
+            var noPointsLabel = ui.Label('No OSM points found in high, very high, or extreme change areas', {color: 'red'});
+            logBox.add(noPointsLabel);
+          } else {
+            highChangePoints.aggregate_array('fclass').evaluate(function(fclassesList) {
+              var fclassCounts = {};
+              fclassesList.forEach(function(fclass) {
+                fclassCounts[fclass] = (fclassCounts[fclass] || 0) + 1;
+              });
+
+              var fclasses = Object.keys(fclassCounts);
+
+              // Generate colors for each fclass
+              var colorMap = generateColorMap(fclasses);
+
+              // Display high change points with different colors based on fclass
+              fclasses.forEach(function(fclass) {
+                var filteredPoints = highChangePoints.filter(ee.Filter.eq('fclass', fclass));
+                Map.addLayer(filteredPoints, {color: colorMap[fclass]}, fclass);
+              });
+
+              // Display the class of each high change point in the panel
+              fclasses.forEach(function(fclass) {
+                var pointInfo = ui.Label('Type: ' + fclass + ' | Count: ' + fclassCounts[fclass], {
+                  color: colorMap[fclass]
+                });
+                logBox.add(pointInfo);
+              });
+            });
+          }
+        });
+
+        // Paint the building footprints onto the empty image
+        var allBuildings = empty.paint({
+          featureCollection: buildingScores,
+          color: 'mean',
+          width: 1
+        });
+
+        var highChangeBuildingOutlines = empty.paint({
+          featureCollection: combinedChangeBuildings,
+          color: 1,
+          width: 1
+        });
+
+        var buildingPalette = [
+          '0000FF', // Blue: low change
+          '00FF00', // Green: medium change
+          'FFFF00', // Yellow: high change
+          'FFA500', // Orange: very high change
+          'FF0000'  // Red: extreme change
+        ];
+
+        // Display all buildings with t-scores using the color palette
+        Map.addLayer(allBuildings, {palette: buildingPalette, min: 0, max: t90}, 'All Buildings');
+        Map.addLayer(highChangeBuildingOutlines, {palette: ['FF0000'], min: 0, max: 1}, 'High Change Buildings');
+      });
+    }
+  });
+}
+
+// Function to run the single image analysis
+function runSingleImageAnalysis(beforeDate, afterDate) {
+  var aoi = userAOI;
+
+  // Get the closest image to the start date
+  var beforeImage = getClosestImage(sentinel1Collection, beforeDate, aoi);
+
+  // Get the closest image to the end date
+  var afterImage = getClosestImage(sentinel1Collection, afterDate, aoi);
+
+  // Get the mean and standard deviation images for the period before the start date
+  var meanAndStdDevBefore = getMeanAndStdDevImages(sentinel1Collection, beforeDate, 3, aoi);
+  var meanImageBefore = meanAndStdDevBefore.mean;
+  var stdDevImageBefore = meanAndStdDevBefore.stdDev;
+  var countBefore = meanAndStdDevBefore.count;
+  var datesBefore = meanAndStdDevBefore.dates;
+
+  // Calculate the t-scores using the single images and the baseline statistics
+  var tScores = calculateTScores(meanImageBefore, stdDevImageBefore, afterImage, detectionType, threshold);
+
+  // Calculate the mean, max, min, and percentiles of the t-scores
+  var stats = tScores.reduceRegion({
+    reducer: ee.Reducer.mean().combine({
+      reducer2: ee.Reducer.minMax(),
+      sharedInputs: true
+    }),
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e9
+  });
+
+  var percentiles = tScores.reduceRegion({
+    reducer: ee.Reducer.percentile([90]),
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e9
+  });
+
+  stats.evaluate(function(result) {
+    meanLabel.setValue('Mean of the t-scores: ' + result.VV_mean);
+    maxLabel.setValue('Max t-score: ' + result.VV_max);
+    minLabel.setValue('Min t-score: ' + result.VV_min);
+  });
+
+  percentiles.evaluate(function(result) {
+    var t90 = result.VV_p90;
+
+    // Display the number of images and their dates
+    beforeImagesLabel.setValue('Images used for before period: ' + countBefore.getInfo());
+    datesBefore.evaluate(function(dates) {
+      beforeDatesLabel.setValue('Dates: ' + dates.join(', '));
+    });
+    
+    // Display the image used for after period
+    afterImagesLabel.setValue('Images used for after period: 1');
+    afterDatesLabel.setValue('Dates: ' + afterDate);
+
+    // Create an empty image
+    var empty = ee.Image().byte();
+
+    // Display the t-scores layer with 60% transparency
+    var tScoresLayer = tScores.updateMask(tScores.gt(0)).visualize({
+      min: 0,
+      max: t90,
+      palette: [
+        '0000FF', // Blue: low change
+        '00FF00', // Green: medium change
+        'FFFF00', // Yellow: high change
+        'FFA500', // Orange: very high change
+        'FF0000'  // Red: extreme change
+      ],
+      opacity: 0.6
+    });
+    Map.addLayer(tScoresLayer, {}, 'T-Scores');
+
+    // Add the legend
+    addLegend();
+
+    // Evaluate the threshold
+    evaluateThreshold(tScores, threshold, logBox);
+
+    // Check if buildings should be ignored
+    if (!ignoreBuildingsCheckbox.getValue()) {
+      // Fetch building footprints and clip to the AOI
+      var datasetPath = countryIso === 'PSE' ? 'projects/ee-guillentorres/assets/PSE_polygons' : 'projects/sat-io/open-datasets/VIDA_COMBINED/' + countryIso;
+      var buildings = ee.FeatureCollection(datasetPath).filterBounds(aoi);
+
+      // Calculate the mean t-score within each building footprint
+      var buildingScores = tScores.reduceRegions({
+        collection: buildings,
+        reducer: ee.Reducer.mean(),
+        scale: 10
+      });
+
+      // Filter buildings with high change, very high change, or extreme change
+      var highChangeBuildings = buildingScores.filter(ee.Filter.gt('mean', t90 * 0.9));
+      var veryHighChangeBuildings = buildingScores.filter(ee.Filter.gt('mean', t90 * 0.95));
+      var extremeChangeBuildings = buildingScores.filter(ee.Filter.gt('mean', t90));
+
+      // Combine the high change buildings into one collection
+      var combinedChangeBuildings = highChangeBuildings.merge(veryHighChangeBuildings).merge(extremeChangeBuildings);
+
+      combinedChangeBuildings.size().evaluate(function(size) {
+        logBox.add(ui.Label('Combined Change Buildings Count: ' + size));
+      });
+
+      // Dissolve the geometry for containment checks
+      var combinedChangeBuildingsGeom = combinedChangeBuildings.geometry().dissolve();
+
+      combinedChangeBuildingsGeom.evaluate(function(geom) {
+        logBox.add(ui.Label('Combined Change Buildings Geometry: ' + JSON.stringify(geom)));
+
+        var highChangePoints = ee.FeatureCollection('projects/ee-guillentorres/assets/points_ukraine_b')
+          .filterBounds(aoi)
+          .filter(ee.Filter.contains({
+            leftField: '.geo',
+            rightValue: combinedChangeBuildingsGeom,
+            maxError: 1
+          }));
+
+        highChangePoints.size().evaluate(function(size) {
+          logBox.add(ui.Label('High Change Points Count: ' + size));
+        });
+
+        highChangePoints.size().evaluate(function(count) {
+          if (count === 0) {
+            var noPointsLabel = ui.Label('No OSM points found in high, very high, or extreme change areas', {color: 'red'});
+            logBox.add(noPointsLabel);
+          } else {
+            highChangePoints.aggregate_array('fclass').evaluate(function(fclassesList) {
+              var fclassCounts = {};
+              fclassesList.forEach(function(fclass) {
+                fclassCounts[fclass] = (fclassCounts[fclass] || 0) + 1;
+              });
+
+              var fclasses = Object.keys(fclassCounts);
+
+              // Generate colors for each fclass
+              var colorMap = generateColorMap(fclasses);
+
+              // Display high change points with different colors based on fclass
+              fclasses.forEach(function(fclass) {
+                var filteredPoints = highChangePoints.filter(ee.Filter.eq('fclass', fclass));
+                Map.addLayer(filteredPoints, {color: colorMap[fclass]}, fclass);
+              });
+
+              // Display the class of each high change point in the panel
+              fclasses.forEach(function(fclass) {
+                var pointInfo = ui.Label('Class: ' + fclass + ' | Count: ' + fclassCounts[fclass], {
+                  color: colorMap[fclass]
+                });
+                logBox.add(pointInfo);
+              });
+            });
+          }
+        });
+
+        // Paint the building footprints onto the empty image
+        var allBuildings = empty.paint({
+          featureCollection: buildingScores,
+          color: 'mean',
+          width: 1
+        });
+
+        // Paint the high change building footprints onto the empty image
+        var highChangeBuildingOutlines = empty.paint({
+          featureCollection: combinedChangeBuildings,
+          color: 1,
+          width: 1
+        });
+
+        // Define a color palette based on t-scores
+        var buildingPalette = [
+          '0000FF', // Blue: low change
+          '00FF00', // Green: medium change
+          'FFFF00', // Yellow: high change
+          'FFA500', // Orange: very high change
+          'FF0000'  // Red: extreme change
+        ];
+
+        // Display all buildings with t-scores using the color palette
+        Map.addLayer(allBuildings, {palette: buildingPalette, min: 0, max: t90}, 'All Buildings');
+        Map.addLayer(highChangeBuildingOutlines, {palette: ['FF0000'], min: 0, max: 1}, 'High Change Buildings');
+      });
+    }
+  });
+}
+
+// Initialize drawing tools
+var drawingTools = Map.drawingTools();
+drawingTools.setShown(true);
+drawingTools.setDrawModes(['rectangle']);
+var userAOI;
+
+// Function to handle AOI drawing completion
+function onDrawingComplete() {
+  // Get the drawn geometry
+  userAOI = drawingTools.layers().get(0).getEeObject();
+
+  // Enable the analyze button
+  analyzeButton.setDisabled(false);
+
+  // Enable the date selectors
+  startYearSelect.setDisabled(false);
+  startMonthSelect.setDisabled(false);
+  startDaySelect.setDisabled(false);
+  endYearSelect.setDisabled(false);
+  endMonthSelect.setDisabled(false);
+  endDaySelect.setDisabled(false);
+}
+
+// Add an event listener to detect when drawing is complete
+drawingTools.onDraw(ui.util.debounce(onDrawingComplete, 500));
+
+// Set Google Maps satellite layer as the base map initially
+setGoogleMapsBaseLayer();
+
+// Function to generate a random color map with valid 6-character hexadecimal strings
+function generateColorMap(classes) {
+  var colorMap = {};
+  classes.forEach(function(c) {
+    var color = Math.floor(Math.random() * 16777215).toString(16);
+    while (color.length < 6) {
+      color = '0' + color; // Ensure the color string is 6 characters long
+    }
+    colorMap[c] = '#' + color;
+  });
+  return colorMap;
+}
+
+// Define the user interface
+var panel = ui.Panel({
+  style: {width: '300px'}
+});
+ui.root.insert(0, panel);
+
+// Title of the app
+var title = ui.Label({
+  value: 'SAR Change Detection Tool',
+  style: {fontWeight: 'bold', fontSize: '20px'}
+});
+panel.add(title);
+
+// Instruction to draw AOI
+var instructions = ui.Label('Draw your area of interest on the map.');
+panel.add(instructions);
+
+// Explanation section
+var explanation = ui.Label({
+  value: 'This tool uses Sentinel-1 SAR data to detect changes in rader backscatter signal within a specified area of interest. You can draw an area, select the dates, and specify the type of change you are interested in detecting. The results are only indicative and should be interpreted as visual leads to groundtruth, not facts.The "construction" detection is not particularly robust, though.',
+  style: {whiteSpace: 'pre-wrap', shown: true}
+});
+panel.add(explanation);
+
 var toggleExplanationButton = ui.Button({
-  label: 'Hide/Show Explanation',
+  label: 'Toggle Explanation',
   onClick: function() {
-    explanationVisible = !explanationVisible;
-    explanation.style().set('shown', explanationVisible);
+    explanation.style().set('shown', !explanation.style().get('shown'));
   }
 });
+panel.add(toggleExplanationButton);
 
-// Dropdown to select a country, initially disabled
-var countrySelect = ui.Select({
-  placeholder: 'Select a country',
-  onChange: fetchCountryData,
-  disabled: true
+// Add a text box for ISO code input
+var isoLabel = ui.Label({
+  value: 'Enter three-letter ISO code:',
+  style: {color: 'blue', textDecoration: 'underline'},
+  targetUrl: 'https://www.iban.com/country-codes'
 });
+var isoInput = ui.Textbox({
+  placeholder: 'ISO code (e.g., LBN)',
+  onChange: function(value) {
+    countryIso = value;
+  }
+});
+panel.add(isoLabel);
+panel.add(isoInput);
 
+var countryIso; // Variable to store ISO code
+
+// Add a dropdown menu for detection type
+var detectionTypeLabel = ui.Label('Select Detection Type:');
+var detectionTypeSelect = ui.Select({
+  items: ['change detection', 'construction'],
+  placeholder: 'Select detection type',
+  onChange: function(value) {
+    detectionType = value;
+  }
+});
+panel.add(detectionTypeLabel);
+panel.add(detectionTypeSelect);
+
+var detectionType; // Variable to store detection type
+
+// Add a checkbox for ignoring buildings
+var ignoreBuildingsCheckbox = ui.Checkbox({
+  label: 'Ignore Buildings',
+  value: false
+});
+panel.add(ignoreBuildingsCheckbox);
+
+// Add a checkbox for single image comparison
+var singleImageCheckbox = ui.Checkbox({
+  label: 'Compare only one after image with multiple before (may help to detect recent or sudden changes)',
+  value: false
+});
+panel.add(singleImageCheckbox);
+
+// Add a slider for threshold selection
+var thresholdLabel = ui.Label('Select Threshold:');
+var thresholdSlider = ui.Slider({
+  min: 0,
+  max: 5,
+  value: 2,
+  step: 0.1,
+  onChange: function(value) {
+    threshold = value;
+  }
+});
+panel.add(thresholdLabel);
+panel.add(thresholdSlider);
+
+var threshold = 2; // Default threshold
 // Labels and dropdowns for selecting start and end dates
 var startDateLabel = ui.Label('Start Date');
 var startYearSelect = ui.Select({
   placeholder: 'Select start year',
-  onChange: updateStartMonths
+  items: ee.List.sequence(2015, 2024).getInfo().map(function(year) {
+    return {label: year.toString(), value: year.toString()};
+  }),
+  disabled: true
 });
 var startMonthSelect = ui.Select({
   placeholder: 'Select start month',
-  onChange: updateStartDays
+  items: ee.List.sequence(1, 12).getInfo().map(function(month) {
+    return {label: month.toString(), value: month.toString()};
+  }),
+  onChange: updateStartDays,
+  disabled: true
 });
 var startDaySelect = ui.Select({
-  placeholder: 'Select start day'
+  placeholder: 'Select start day',
+  disabled: true
 });
+var startRow = ui.Panel({
+  widgets: [startYearSelect, startMonthSelect],
+  layout: ui.Panel.Layout.Flow('horizontal')
+});
+
 var endDateLabel = ui.Label('End Date');
 var endYearSelect = ui.Select({
   placeholder: 'Select end year',
-  onChange: updateEndMonths
+  items: ee.List.sequence(2015, 2024).getInfo().map(function(year) {
+    return {label: year.toString(), value: year.toString()};
+  }),
+  disabled: true
 });
 var endMonthSelect = ui.Select({
   placeholder: 'Select end month',
-  onChange: updateEndDays
+  items: ee.List.sequence(1, 12).getInfo().map(function(month) {
+    return {label: month.toString(), value: month.toString()};
+  }),
+  onChange: updateEndDays,
+  disabled: true
 });
 var endDaySelect = ui.Select({
-  placeholder: 'Select end day'
+  placeholder: 'Select end day',
+  disabled: true
+});
+var endRow = ui.Panel({
+  widgets: [endYearSelect, endMonthSelect],
+  layout: ui.Panel.Layout.Flow('horizontal')
 });
 
-// Label and dropdown for selecting the type of analysis (construction or destruction)
-var analysisTypeLabel = ui.Label('Analysis Type');
-var analysisTypeSelect = ui.Select({
-  items: [
-    {label: 'Construction', value: 'construction'},
-    {label: 'Destruction', value: 'destruction'}
-  ],
-  value: 'construction'
-});
-
-// Buttons for starting analysis, resetting the app, and showing Google Maps link
-var analyzeButton = ui.Button('Analyze', analyze);
-var messageLabel = ui.Label('');
-var resetButton = ui.Button('Reset', resetApp);
-var showMapLinkButton = ui.Button('Show Google Maps Link', showGoogleMapsLink);
-var googleMapsLinkLabel = ui.Label('', {shown: false});
-
-// Add a gradient legend to the UI
-var legendPanel = ui.Panel({
-  layout: ui.Panel.Layout.flow('vertical'),
-  style: {stretch: 'horizontal', margin: '8px 0'}
-});
-
-// Thumbnail for the gradient legend image, with colors from green to red
-var gradientImage = ui.Thumbnail({
-  image: ee.Image.pixelLonLat().select(0),
-  params: {
-    bbox: [0, 0, 1, 0.1],
-    dimensions: '300x20',  // Adjusted dimensions for larger gradient
-    format: 'png',
-    min: 0,
-    max: 1,
-    palette: ['green', 'yellow', 'red']
-  },
-  style: {stretch: 'horizontal', margin: '8px 0'}
-});
-
-// Labels for the legend indicating the range of changes
-var legendLabels = ui.Panel({
-  layout: ui.Panel.Layout.flow('horizontal'),
-  style: {stretch: 'horizontal'}
-});
-var legendLabelMin = ui.Label('Minimal change', {fontSize: '12px'});
-var legendLabelMid = ui.Label('Moderate change', {fontSize: '12px'});
-var legendLabelMax = ui.Label('Substantial change', {fontSize: '12px'});
-
-// Add labels to the legend
-legendLabels.add(legendLabelMin);
-legendLabels.add(ui.Label('', {stretch: 'horizontal'})); // Spacer
-legendLabels.add(legendLabelMid);
-legendLabels.add(ui.Label('', {stretch: 'horizontal'})); // Spacer
-legendLabels.add(legendLabelMax);
-
-// Add the gradient image and labels to the legend panel
-legendPanel.add(gradientImage);
-legendPanel.add(legendLabels);
-
-// Add elements to the main panel
-panel.add(ui.Label({value: 'Search for visual leads of recent construction or destruction', style: {fontWeight: 'bold'}}));
-panel.add(toggleExplanationButton);
-panel.add(explanation);
-panel.add(ui.Label('Draw an AOI to enable country selection.'));
-panel.add(countrySelect);
+// Add inputs to the panel
 panel.add(startDateLabel);
-panel.add(startYearSelect);
-panel.add(startMonthSelect);
+panel.add(startRow);
 panel.add(startDaySelect);
 panel.add(endDateLabel);
-panel.add(endYearSelect);
-panel.add(endMonthSelect);
+panel.add(endRow);
 panel.add(endDaySelect);
-panel.add(analysisTypeLabel);
-panel.add(analysisTypeSelect);
+
+// Button to run the analysis (initially disabled)
+var analyzeButton = ui.Button({
+  label: 'Analyze',
+  onClick: function() {
+    var beforeYear = startYearSelect.getValue();
+    var beforeMonth = startMonthSelect.getValue();
+    var beforeDay = startDaySelect.getValue();
+    var beforeDate = beforeYear + '-' + beforeMonth + '-' + beforeDay;
+
+    var afterYear = endYearSelect.getValue();
+    var afterMonth = endMonthSelect.getValue();
+    var afterDay = endDaySelect.getValue();
+    var afterDate = afterYear + '-' + afterMonth + '-' + afterDay;
+
+    // Clear the AOI rectangle
+    drawingTools.layers().reset();
+    drawingTools.setDrawModes(['rectangle']);
+
+    if (singleImageCheckbox.getValue()) {
+      runSingleImageAnalysis(beforeDate, afterDate);
+    } else {
+      runAnalysis(beforeDate, afterDate);
+    }
+  },
+  disabled: true
+});
 panel.add(analyzeButton);
+
+// Add a box for logging and informing the user
+var logBox = ui.Panel({
+  style: {backgroundColor: '#f0f0f0', padding: '8px'}
+});
+panel.add(logBox);
+
+var meanLabel = ui.Label('Mean of the t-scores: ');
+var maxLabel = ui.Label('Max t-score: ');
+var minLabel = ui.Label('Min t-score: ');
+logBox.add(meanLabel);
+logBox.add(maxLabel);
+logBox.add(minLabel);
+
+var beforeImagesLabel = ui.Label('Images used for before period: ');
+var beforeDatesLabel = ui.Label('');
+var afterImagesLabel = ui.Label('Images used for after period: ');
+var afterDatesLabel = ui.Label('');
+logBox.add(beforeImagesLabel);
+logBox.add(beforeDatesLabel);
+logBox.add(afterImagesLabel);
+logBox.add(afterDatesLabel);
+
+// Google Maps link button
+var googleMapsButton = ui.Button({
+  label: 'Get Google Maps Link',
+  onClick: function() {
+    var center = Map.getCenter();
+    center.evaluate(function(coords) {
+      var zoom = Map.getZoom();
+      var url = 'https://www.google.com/maps/@' + coords.coordinates[1] + ',' + coords.coordinates[0] + ',' + zoom + 'z';
+      var googleMapsLink = ui.Label({
+        value: 'Open in Google Maps',
+        style: {color: 'blue', textDecoration: 'underline'},
+        targetUrl: url
+      });
+      logBox.add(googleMapsLink);
+    });
+  }
+});
+panel.add(googleMapsButton);
+
+// Reset button to reset the app to its initial state
+var resetButton = ui.Button({
+  label: 'Reset',
+  onClick: function() {
+    resetApp();
+  }
+});
 panel.add(resetButton);
-panel.add(showMapLinkButton);
-panel.add(googleMapsLinkLabel);
-panel.add(messageLabel);
-panel.add(legendPanel);
 
-// Initialize map and add the panel to the map
-var map = ui.Map();
-ui.root.clear();
-ui.root.add(panel);
-ui.root.add(map);
+// Function to reset the app to its initial state
+function resetApp() {
+  // Clear all user inputs
+  isoInput.setValue('');
+  detectionTypeSelect.setValue(null);
+  thresholdSlider.setValue(2);
+  startYearSelect.setValue(null);
+  startMonthSelect.setValue(null);
+  startDaySelect.setValue(null);
+  endYearSelect.setValue(null);
+  endMonthSelect.setValue(null);
+  endDaySelect.setValue(null);
+  ignoreBuildingsCheckbox.setValue(false);
+  singleImageCheckbox.setValue(false);
+  
+  // Clear the labels
+  meanLabel.setValue('Mean of the t-scores: ');
+  maxLabel.setValue('Max t-score: ');
+  minLabel.setValue('Min t-score: ');
+  beforeImagesLabel.setValue('Images used for before period: ');
+  beforeDatesLabel.setValue('');
+  afterImagesLabel.setValue('Images used for after period: ');
+  afterDatesLabel.setValue('');
+  
+  // Clear the log box
+  logBox.clear();
 
-// Center the map on Mariupol, Ukraine
-map.setCenter(37.6173, 47.0951, 12); // Centering the map on Mariupol, Ukraine
+  // Clear map layers and reset drawing tools
+  Map.clear();
+  drawingTools.setShown(true);
+  drawingTools.setDrawModes(['rectangle']);
+  drawingTools.layers().reset();
 
-// Initialize drawing tools for the map
-var drawingTools = map.drawingTools();
-drawingTools.setShown(true);
-drawingTools.layers().reset();
-drawingTools.setDrawModes(['polygon', 'rectangle']);
-drawingTools.onDraw(function(geometry) {
-  countrySelect.setDisabled(false);  // Enable country selection after AOI is drawn
-  console.log('AOI drawn:', geometry);
-});
+  // Disable analyze button
+  analyzeButton.setDisabled(true);
+  
+  // Disable date selectors
+  startYearSelect.setDisabled(true);
+  startMonthSelect.setDisabled(true);
+  startDaySelect.setDisabled(true);
+  endYearSelect.setDisabled(true);
+  endMonthSelect.setDisabled(true);
+  endDaySelect.setDisabled(true);
 
-// Debugging: Log UI Initialization
-console.log('UI initialized.');
+  // Set Google Maps satellite layer as the base map initially
+  setGoogleMapsBaseLayer();
 
-// Function to fetch country data (currently a placeholder)
-function fetchCountryData() {
-  // No additional functionality needed here for now
+  // Re-initialize the log box
+  panel.remove(logBox);
+  logBox = ui.Panel({
+    style: {backgroundColor: '#f0f0f0', padding: '8px'}
+  });
+  panel.add(logBox);
+  logBox.add(meanLabel);
+  logBox.add(maxLabel);
+  logBox.add(minLabel);
+  logBox.add(beforeImagesLabel);
+  logBox.add(beforeDatesLabel);
+  logBox.add(afterImagesLabel);
+  logBox.add(afterDatesLabel);
 }
 
-// Load and sort country data, then populate the country dropdown
-countryList.aggregate_array('Country').evaluate(function(names) {
-  if (names) {
-    names = names.sort();
-    countrySelect.items().reset(names.map(function(name) {
-      return {
-        label: name,
-        value: name
-      };
-    }));
-    // Debugging: Log Country Data Loaded
-    console.log('Country data loaded:', names);
-  } else {
-    showError('Error: Country names are undefined.');
-  }
-});
-
-// Fetch available years for the date selectors
-function fetchAvailableYears() {
-  var years = ee.List.sequence(2015, 2024).getInfo();
-  startYearSelect.items().reset(years.map(function(year) {
-    return {label: year.toString(), value: year.toString()};
-  }));
-  endYearSelect.items().reset(years.map(function(year) {
-    return {label: year.toString(), value: year.toString()};
-  }));
-}
-
-// Update months based on the selected start year
-function updateStartMonths() {
-  var year = startYearSelect.getValue();
-  if (year) {
-    var months = ee.List.sequence(1, 12).getInfo();
-    startMonthSelect.items().reset(months.map(function(month) {
-      return {label: month.toString(), value: month.toString()};
-    }));
-    console.log('Start year selected:', year);
-  }
-}
-
-// Update months based on the selected end year
-function updateEndMonths() {
-  var year = endYearSelect.getValue();
-  if (year) {
-    var months = ee.List.sequence(1, 12).getInfo();
-    endMonthSelect.items().reset(months.map(function(month) {
-      return {label: month.toString(), value: month.toString()};
-    }));
-    console.log('End year selected:', year);
-  }
-}
-
-// Update days based on the selected start year and month
+// Function to fetch available days for the selected start month and year
 function updateStartDays() {
   var year = parseInt(startYearSelect.getValue(), 10);
   var month = parseInt(startMonthSelect.getValue(), 10);
-  var country = countrySelect.getValue();
-  var aoi = drawingTools.layers().get(0).getEeObject();
+  var aoi = userAOI;
 
-  if (year && month && country && aoi) {
+  if (year && month && aoi) {
     var startDate = ee.Date.fromYMD(year, month, 1);
     var endDate = startDate.advance(1, 'month');
     var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
@@ -229,7 +842,6 @@ function updateStartDays() {
       .filterDate(startDate, endDate)
       .filter(ee.Filter.eq('instrumentMode', 'IW'))
       .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
-      .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
       .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
       
     sentinel1.aggregate_array('system:time_start').evaluate(function(dates) {
@@ -244,14 +856,13 @@ function updateStartDays() {
   }
 }
 
-// Update days based on the selected end year and month
+// Function to fetch available days for the selected end month and year
 function updateEndDays() {
   var year = parseInt(endYearSelect.getValue(), 10);
   var month = parseInt(endMonthSelect.getValue(), 10);
-  var country = countrySelect.getValue();
-  var aoi = drawingTools.layers().get(0).getEeObject();
+  var aoi = userAOI;
 
-  if (year && month && country && aoi) {
+  if (year && month && aoi) {
     var startDate = ee.Date.fromYMD(year, month, 1);
     var endDate = startDate.advance(1, 'month');
     var sentinel1 = ee.ImageCollection('COPERNICUS/S1_GRD')
@@ -259,7 +870,6 @@ function updateEndDays() {
       .filterDate(startDate, endDate)
       .filter(ee.Filter.eq('instrumentMode', 'IW'))
       .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
-      .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
       .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
       
     sentinel1.aggregate_array('system:time_start').evaluate(function(dates) {
@@ -273,324 +883,3 @@ function updateEndDays() {
     });
   }
 }
-
-// Define the Sentinel-1 collection function with orbit filtering
-function filter_s1(paths, startDate, endDate, aoi) {
-  var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
-    .filter(ee.Filter.eq('instrumentMode', 'IW'))
-    .filter(ee.Filter.inList('orbitProperties_pass', paths))
-    .filterDate(startDate, endDate)
-    .filterBounds(aoi)
-    .select(['VV', 'VH']);  // Select both VV and VH polarizations
-
-  var orbit = s1.aggregate_array('relativeOrbitNumber_start').reduce(ee.Reducer.mode());
-  s1 = s1.filter(ee.Filter.eq('relativeOrbitNumber_start', orbit));
-  
-  return s1;
-}
-
-// Function to get the mean, standard deviation, and count of images for a period
-function getStats(collection, aoi) {
-  var images = collection.filterBounds(aoi);
-  var meanImageVV = images.select('VV').mean().clip(aoi);
-  var meanImageVH = images.select('VH').mean().clip(aoi);
-  var stdDevImageVV = images.select('VV').reduce(ee.Reducer.stdDev()).clip(aoi);
-  var stdDevImageVH = images.select('VH').reduce(ee.Reducer.stdDev()).clip(aoi);
-  var count = ee.Number(images.size());
-  return {
-    meanVV: meanImageVV,
-    meanVH: meanImageVH,
-    stdDevVV: stdDevImageVV,
-    stdDevVH: stdDevImageVH,
-    count: count
-  };
-}
-
-// Apply Gaussian smoothing to an image
-function applyGaussianSmoothing(image, radius) {
-  var gaussianKernel = ee.Kernel.gaussian({
-    radius: radius,
-    sigma: radius / 3,
-    units: 'meters',
-    normalize: true
-  });
-  return image.convolve(gaussianKernel);
-}
-
-// Fetch Sentinel-1 Data for a given AOI and date range
-function fetchSentinel1Data(aoi, startDate, endDate) {
-  console.log('Fetching Sentinel-1 data for AOI:', aoi, 'Start date:', startDate, 'End date:', endDate);
-
-  var paths = ['ASCENDING', 'DESCENDING'];
-  var s1 = filter_s1(paths, startDate, endDate, aoi);
-  // Debugging: Log Sentinel-1 Data Fetch Status
-  console.log('Sentinel-1 data fetched:', s1);
-
-  return s1;
-}
-
-// Function to fetch only five images before the start and end dates
-function fetchFiveImages(collection, date) {
-  var filtered = collection.filterDate('2015-01-01', date).sort('system:time_start', false);
-  var limited = filtered.limit(5);
-  return limited;
-}
-
-// Compute T-Scores for change detection
-function computeTScores(sentinel1, aoi, analysisType) {
-  console.log('Computing T-scores for Sentinel-1 data');
-
-  // Get the dates for splitting
-  var dates = ee.List(sentinel1.aggregate_array('system:time_start')).map(function(d) {
-    return ee.Date(d);
-  });
-  var startDate = ee.Date(dates.sort().get(0));
-  var midDate = ee.Date(dates.sort().get(ee.Number(dates.size()).divide(2).floor()));
-  var endDate = ee.Date(dates.sort().get(dates.size().subtract(1)));
-
-  var before = fetchFiveImages(sentinel1, midDate);
-  var after = fetchFiveImages(sentinel1, endDate);
-
-  var beforeStats = getStats(before, aoi);
-  var afterStats = getStats(after, aoi);
-
-  var diffVV = afterStats.meanVV.subtract(beforeStats.meanVV);
-  var diffVH = afterStats.meanVH.subtract(beforeStats.meanVH);
-
-  var stdDevVV = beforeStats.stdDevVV;
-  var stdDevVH = beforeStats.stdDevVH;
-
-  var tScoreVV = diffVV.divide(stdDevVV);
-  var tScoreVH = diffVH.divide(stdDevVH);
-
-  var tScore = tScoreVV.add(tScoreVH).divide(2);
-
-  if (analysisType === 'destruction') {
-    tScore = tScore.multiply(-1);
-  }
-
-  // Debugging: Log T-Scores Computed
-  console.log('T-scores computed:', tScore);
-
-  return tScore;
-}
-
-// Clip T-Score image to the AOI
-function clipToAOI(image, aoi) {
-  console.log('Clipping T-score image to AOI');
-  var clippedImage = image.clip(aoi);
-  // Debugging: Log Clipped Image
-  console.log('Clipped T-score image:', clippedImage);
-  return clippedImage;
-}
-
-// Assign T-Scores to buildings within the AOI
-function assignTScoresToBuildings(tScoreImage, aoi, country) {
-  console.log('Assigning T-scores to buildings in AOI for country:', country);
-
-  var buildings;
-  if (country === 'Palestine, State of') {
-    buildings = ee.FeatureCollection('projects/ee-guillentorres/assets/PSE_polygons');
-  } else {
-    var datasetPath = 'projects/sat-io/open-datasets/VIDA_COMBINED/' + country;
-    buildings = ee.FeatureCollection(datasetPath).filterBounds(aoi);
-  }
-
-  var buildingScores = buildings.map(function(building) {
-    var meanTScore = tScoreImage.reduceRegion({
-      reducer: ee.Reducer.mean(),
-      geometry: building.geometry(),
-      scale: 10
-    }).get('VV');
-
-    return building.set('meanTScore', meanTScore);
-  });
-
-  // Debugging: Log Building Scores
-  console.log('Building scores assigned:', buildingScores);
-
-  return buildingScores;
-}
-
-// Visualize results on the map
-function visualizeResults(buildingScores) {
-  console.log('Visualizing results');
-
-  var palette = ['green', 'yellow', 'red'];
-
-  var image = ee.Image().float().paint(buildingScores, 'meanTScore');
-  var visParams = {
-    min: -30,
-    max: 30,
-    palette: palette
-  };
-
-  // Clear previous layers
-  map.layers().reset();
-
-  // Add the new layer
-  map.layers().set(0, ui.Map.Layer(image, visParams, 'T-Scores'));
-
-  // Debugging: Log Visualization
-  console.log('Results visualized on the map');
-}
-
-// Analyze function to start the analysis process
-function analyze() {
-  console.log('Starting analysis');
-
-  var aoi = drawingTools.layers().get(0).getEeObject();
-
-  if (!aoi) {
-    showError('Please draw an AOI first.');
-    print('Error: No AOI drawn');
-    return;
-  }
-
-  var country = countrySelect.getValue();
-  var startYear = startYearSelect.getValue();
-  var startMonth = startMonthSelect.getValue();
-  var startDay = startDaySelect.getValue();
-  var endYear = endYearSelect.getValue();
-  var endMonth = endMonthSelect.getValue();
-  var endDay = endDaySelect.getValue();
-  var analysisType = analysisTypeSelect.getValue();
-
-  if (!country) {
-    showError('Please select a country.');
-    print('Error: No country selected');
-    return;
-  }
-
-  if (!startYear || !startMonth || !startDay || !endYear || !endMonth || !endDay) {
-    showError('Please select valid start and end dates.');
-    print('Error: Invalid date selection');
-    return;
-  }
-
-  var startDate = ee.Date.fromYMD(parseInt(startYear, 10), parseInt(startMonth, 10), parseInt(startDay, 10));
-  var endDate = ee.Date.fromYMD(parseInt(endYear, 10), parseInt(endMonth, 10), parseInt(endDay, 10));
-
-  // Clear AOI after analysis
-  drawingTools.layers().reset();
-
-  // Check if the selected country is "Palestine, State of" and use the appropriate dataset
-  if (country === 'Palestine, State of') {
-    showLoading('Fetching data and running analysis...');
-    console.log('AOI:', aoi);
-    console.log('Country:', country);
-    console.log('Start Date:', startDate);
-    console.log('End Date:', endDate);
-
-    var sentinel1 = fetchSentinel1Data(aoi, startDate, endDate);
-    var tScores = computeTScores(sentinel1, aoi, analysisType);
-    var clippedTScores = clipToAOI(tScores, aoi);
-    var buildingScores = assignTScoresToBuildings(clippedTScores, aoi, 'Palestine, State of');
-
-    // Filter buildings based on T-scores
-    var filteredBuildings = analysisType === 'destruction' ?
-      buildingScores.filter(ee.Filter.lt('meanTScore', 0)) :
-      buildingScores.filter(ee.Filter.gt('meanTScore', 0));
-
-    visualizeResults(filteredBuildings);
-
-    hideLoading();
-    console.log('Analysis completed for Palestine, State of');
-  } else {
-    // Fetch the country ISO code
-    countryList.filter(ee.Filter.eq('Country', country)).first().get('ISO').evaluate(function(countryISO) {
-      if (!countryISO) {
-        showError('Error: ISO code for the selected country not found.');
-        return;
-      }
-
-      showLoading('Fetching data and running analysis...');
-      console.log('AOI:', aoi);
-      console.log('Country:', country);
-      console.log('Country ISO:', countryISO);
-      console.log('Start Date:', startDate);
-      console.log('End Date:', endDate);
-
-      var sentinel1 = fetchSentinel1Data(aoi, startDate, endDate);
-      var tScores = computeTScores(sentinel1, aoi, analysisType);
-      var clippedTScores = clipToAOI(tScores, aoi);
-      var buildingScores = assignTScoresToBuildings(clippedTScores, aoi, countryISO);
-
-      // Filter buildings based on T-scores
-      var filteredBuildings = analysisType === 'destruction' ?
-        buildingScores.filter(ee.Filter.lt('meanTScore', 0)) :
-        buildingScores.filter(ee.Filter.gt('meanTScore', 0));
-
-      visualizeResults(filteredBuildings);
-
-      hideLoading();
-      console.log('Analysis completed');
-    });
-  }
-}
-
-// Show Google Maps link centered on the current map view
-function showGoogleMapsLink() {
-  var center = map.getCenter();
-  center.evaluate(function(center) {
-    var zoom = map.getZoom();
-    var url = 'https://www.google.com/maps/@' + center.coordinates[1] + ',' + center.coordinates[0] + ',' + zoom + 'z';
-    googleMapsLinkLabel.setValue('');
-    panel.remove(googleMapsLinkLabel);
-    googleMapsLinkLabel = ui.Label({
-      value: 'Open in Google Maps',
-      style: {color: 'blue', textDecoration: 'underline'},
-      targetUrl: url
-    });
-    panel.add(googleMapsLinkLabel);
-    googleMapsLinkLabel.style().set('shown', true);
-  });
-}
-
-// Show error messages to the user
-function showError(message) {
-  messageLabel.setValue(message);
-  messageLabel.style().set('color', 'red');
-  print('Error:', message);
-}
-
-// Show loading messages to the user
-function showLoading(message) {
-  messageLabel.setValue(message);
-  messageLabel.style().set('color', 'black');
-  console.log('Loading:', message);
-}
-
-// Hide loading messages
-function hideLoading() {
-  messageLabel.setValue('');
-  console.log('Loading finished');
-}
-
-// Reset the application to its initial state
-function resetApp() {
-  console.log('Resetting application to initial state');
-
-  // Clear drawing tools
-  drawingTools.layers().reset();
-  drawingTools.setDrawModes(['polygon', 'rectangle']);
-  countrySelect.setDisabled(true);
-
-  // Reset UI elements
-  countrySelect.setValue(null, false);
-  startYearSelect.setValue(null, false);
-  startMonthSelect.setValue(null, false);
-  startDaySelect.setValue(null, false);
-  endYearSelect.setValue(null, false);
-  endMonthSelect.setValue(null, false);
-  endDaySelect.setValue(null, false);
-
-  // Clear map layers
-  map.layers().reset();
-
-  // Clear message label
-  messageLabel.setValue('');
-}
-
-// Fetch available years when the app initializes
-fetchAvailableYears();
